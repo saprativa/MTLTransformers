@@ -47,6 +47,7 @@ from transformers import (
 )
 from BART_multi import BartForMultiSum
 from bart_multi_data_collator import DataCollatorWithPaddingClassification
+from BART_multi_trainer import MultiTrainer
 from transformers.trainer_utils import get_last_checkpoint
 from transformers.utils import check_min_version, is_offline_mode
 from transformers.utils.versions import require_version
@@ -662,15 +663,24 @@ def main():
         return result
 
     # Initialize our Trainer
-    trainer = Seq2SeqTrainer(
-        model=model,
-        args=training_args,
-        train_dataset=train_dataset if training_args.do_train else None,
-        eval_dataset=eval_dataset if training_args.do_eval else None,
-        tokenizer=tokenizer,
-        data_collator=data_collator,
-        compute_metrics=compute_metrics if training_args.predict_with_generate else None,
-    )
+    # trainer = Seq2SeqTrainer(
+    #     model=model,
+    #     args=training_args,
+    #     train_dataset=train_dataset if training_args.do_train else None,
+    #     eval_dataset=eval_dataset if training_args.do_eval else None,
+    #     tokenizer=tokenizer,
+    #     data_collator=data_collator,
+    #     compute_metrics=compute_metrics if training_args.predict_with_generate else None,
+    # )
+
+    trainer = MultiTrainer(model=model, args=training_args,
+                           train_dataset=train_dataset if training_args.do_train else None,
+                           train_dataset_ex=train_dataset_ex if data_args.train_ex else None,
+                           eval_dataset=eval_dataset if training_args.do_eval else None,
+                           tokenizer=tokenizer,
+                           data_collator=data_collator,
+                           data_collator_ex=data_collator_ex,
+                           compute_metrics=compute_metrics if training_args.predict_with_generate else None,)
 
     # Training
     if training_args.do_train:

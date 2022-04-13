@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import random
+import torch
 import warnings
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, NewType, Optional, Tuple, Union
@@ -250,6 +251,35 @@ class DataCollatorWithPadding:
             pad_to_multiple_of=self.pad_to_multiple_of,
             return_tensors=self.return_tensors,
         )
+        if "label" in batch:
+            batch["labels"] = batch["label"]
+            del batch["label"]
+        if "label_ids" in batch:
+            batch["labels"] = batch["label_ids"]
+            del batch["label_ids"]
+        return batch
+
+
+@dataclass
+class DataCollatorWithPaddingClassification:
+    tokenizer: PreTrainedTokenizerBase
+    padding: Union[bool, str, PaddingStrategy] = True
+    max_length: Optional[int] = None
+    pad_to_multiple_of: Optional[int] = None
+
+    def __call__(self, features: List[Dict[str, Union[List[int], torch.Tensor]]]) -> Dict[str, torch.Tensor]:
+        _features = []
+        for x in features:
+            new_dic = {}
+            for key in x:
+                if key == 'labels':
+                    continue
+                else:
+                    new_dic[key] = x[key]
+            _features.append(new_dic)
+
+        batch = self.tokenizer.pad(_features, padding=self.padding, max_length=self.max_length, pad_to_multiple_of=self.pad_to_multiple_of, return_tensors="pt",)
+        batch['labels'] = torch.tensor([int(x['labels']) for x in features])
         if "label" in batch:
             batch["labels"] = batch["label"]
             del batch["label"]
