@@ -192,7 +192,7 @@ SCHEDULER_NAME = "scheduler.pt"
 SCALER_NAME = "scaler.pt"
 
 
-class Trainer:
+class MultiTrainer:
     """
     Trainer is a simple but feature-complete training and eval loop for PyTorch, optimized for 🤗 Transformers.
 
@@ -281,7 +281,9 @@ class Trainer:
         model: Union[PreTrainedModel, nn.Module] = None,
         args: TrainingArguments = None,
         data_collator: Optional[DataCollator] = None,
+        data_collator_ex: Optional[DataCollator] = None,
         train_dataset: Optional[Dataset] = None,
+        train_dataset_ex: Optional[Dataset] = None,
         eval_dataset: Optional[Dataset] = None,
         tokenizer: Optional[PreTrainedTokenizerBase] = None,
         model_init: Callable[[], PreTrainedModel] = None,
