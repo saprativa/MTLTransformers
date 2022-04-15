@@ -3,9 +3,9 @@ python run_summarization.py \
     --model_name_or_path sshleifer/distilbart-cnn-6-6 \
     --do_train \
     --do_eval \
-    --train_file ../../MultiAbs/data/ami/train.csv \
-    --validation_file ../../MultiAbs/data/ami/val.csv \
-    --output_dir /tmp/sb-summarization \
+    --train_file ../data/ami/train.csv \
+    --validation_file ../data/ami/val.csv \
+    --output_dir /tmp/sb-summarization/ \
     --overwrite_output_dir \
     --per_device_train_batch_size=4 \
     --per_device_eval_batch_size=4 \
@@ -28,3 +28,57 @@ python run_summarization.py \
   eval_samples            =         14
   eval_samples_per_second =      4.314
   eval_steps_per_second   =      0.308
+
+*******************************************************************
+15-04-2022
+*******************************************************************
+On branch main
+
+CUDA_VISIBLE_DEVICES=1,2,3,4 \
+python run_summarization.py \
+    --model_name_or_path sshleifer/distilbart-cnn-6-6 \
+    --do_train \
+    --do_eval \
+    --train_file ../../MultiAbs/data/ami/train.csv \
+    --validation_file ../../MultiAbs/data/ami/val.csv \
+    --output_dir /tmp/sb-summarization \
+    --overwrite_output_dir \
+    --per_device_train_batch_size=4 \
+    --per_device_eval_batch_size=4 \
+    --predict_with_generate \
+    --save_strategy epoch \
+    --evaluation_strategy epoch \
+    --load_best_model_at_end \
+    --metric_for_best_model eval_rouge1
+
+
+***** eval metrics *****
+  epoch                   =        3.0
+  eval_gen_len            =      128.0
+  eval_loss               =     3.0001
+  eval_rouge1             =    44.7617
+  eval_rouge2             =    16.7327
+  eval_rougeL             =    27.0512
+  eval_rougeLsum          =    42.1076
+  eval_runtime            = 0:00:03.66
+  eval_samples            =         14
+  eval_samples_per_second =      3.816
+  eval_steps_per_second   =      0.273
+
+
+Surprisingly on branch test
+
+same command gives
+
+***** eval metrics *****
+  epoch                   =        3.0
+  eval_gen_len            =      128.0
+  eval_loss               =     2.9257
+  eval_rouge1             =    44.8581
+  eval_rouge2             =    16.2638
+  eval_rougeL             =    25.9296
+  eval_rougeLsum          =    41.2021
+  eval_runtime            = 0:00:03.59
+  eval_samples            =         14
+  eval_samples_per_second =       3.89
+  eval_steps_per_second   =      0.278
