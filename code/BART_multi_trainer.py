@@ -131,8 +131,11 @@ from transformers.utils import (
     is_sagemaker_dp_enabled,
     is_sagemaker_mp_enabled,
     is_torch_tpu_available,
-    logging,
+    # logging,
 )
+
+import logging
+import transformers
 
 
 _is_torch_generator_available = False
@@ -181,7 +184,8 @@ if is_sagemaker_mp_enabled():
 if TYPE_CHECKING:
     import optuna
 
-logger = logging.get_logger(__name__)
+# logger = logging.get_logger(__name__)
+logger = logging.getLogger(__name__)
 
 
 # Name of the files used for checkpointing
@@ -308,8 +312,21 @@ class MultiTrainer:
         self._memory_tracker.start()
 
         # set the correct log level depending on the node
-        log_level = args.get_process_log_level()
-        logging.set_verbosity(log_level)
+        # log_level = args.get_process_log_level()
+        # logging.set_verbosity(log_level)
+
+        # Setup logging
+        logging.basicConfig(    
+            format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
+            datefmt="%m/%d/%Y %H:%M:%S",
+            handlers=[logging.StreamHandler(sys.stdout)],
+        )
+        log_level = 20
+        logger.setLevel(log_level)
+        datasets.utils.logging.set_verbosity(log_level)
+        transformers.utils.logging.set_verbosity(log_level)
+        transformers.utils.logging.enable_default_handler()
+        transformers.utils.logging.enable_explicit_format()
 
         # force device and distributed setup init explicitly
         args._setup_devices
