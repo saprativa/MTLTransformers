@@ -39,9 +39,9 @@ python run_summarization.py \
     --model_name_or_path sshleifer/distilbart-cnn-6-6 \
     --do_train \
     --do_eval \
-    --train_file ../../MultiAbs/data/ami/train.csv \
-    --validation_file ../../MultiAbs/data/ami/val.csv \
-    --output_dir /tmp/sb-summarization \
+    --train_file ../data/ami/train.csv \
+    --validation_file ../data/ami/val.csv \
+    --output_dir /tmp/sb-summarization/ \
     --overwrite_output_dir \
     --per_device_train_batch_size=4 \
     --per_device_eval_batch_size=4 \
