@@ -45,6 +45,9 @@ from transformers import (
     Seq2SeqTrainingArguments,
     set_seed,
 )
+from BART_multi import BartForMultiSum
+from bart_multi_data_collator import DataCollatorWithPaddingClassification
+from BART_multi_trainer import MultiTrainer
 from transformers.trainer_utils import get_last_checkpoint
 from transformers.utils import check_min_version, is_offline_mode
 from transformers.utils.versions import require_version
@@ -138,6 +141,9 @@ class DataTrainingArguments:
     )
     train_file: Optional[str] = field(
         default=None, metadata={"help": "The input training data file (a jsonlines or csv file)."}
+    )
+    train_ex: bool = field(
+        default=False, metadata={"help": "Train Extractive auxiliary task or not."}
     )
     validation_file: Optional[str] = field(
         default=None,
@@ -351,6 +357,8 @@ def main():
         if data_args.train_file is not None:
             data_files["train"] = data_args.train_file
             extension = data_args.train_file.split(".")[-1]
+            if os.path.exists(data_args.train_file.replace('.' + extension, '_ex.' + extension)):
+                data_files["train_ex"] = data_args.train_file.replace('.' + extension, '_ex.' + extension)
         if data_args.validation_file is not None:
             data_files["validation"] = data_args.validation_file
             extension = data_args.validation_file.split(".")[-1]
@@ -384,15 +392,16 @@ def main():
         revision=model_args.model_revision,
         use_auth_token=True if model_args.use_auth_token else None,
     )
-    model = AutoModelForSeq2SeqLM.from_pretrained(
-        model_args.model_name_or_path,
-        from_tf=bool(".ckpt" in model_args.model_name_or_path),
-        config=config,
-        cache_dir=model_args.cache_dir,
-        revision=model_args.model_revision,
-        use_auth_token=True if model_args.use_auth_token else None,
-    )
+    # model = AutoModelForSeq2SeqLM.from_pretrained(
+    #     model_args.model_name_or_path,
+    #     from_tf=bool(".ckpt" in model_args.model_name_or_path),
+    #     config=config,
+    #     cache_dir=model_args.cache_dir,
+    #     revision=model_args.model_revision,
+    #     use_auth_token=True if model_args.use_auth_token else None,
+    # )
 
+    model = BartForMultiSum.from_pretrained(model_args.model_name_or_path)
     model.resize_token_embeddings(len(tokenizer))
 
     if model.config.decoder_start_token_id is None and isinstance(tokenizer, (MBartTokenizer, MBartTokenizerFast)):
@@ -507,6 +516,32 @@ def main():
         model_inputs["labels"] = labels["input_ids"]
         return model_inputs
 
+    def preprocess_function_ex(examples):
+        # remove pairs where at least one record is None
+
+        inputs, targets = [], []
+        for i in range(len(examples[text_column])):
+            if examples[text_column][i] is not None and examples[summary_column][i] is not None:
+                inputs.append(examples[text_column][i])
+                targets.append(examples[summary_column][i])
+
+        inputs = [prefix + inp for inp in inputs]
+        model_inputs = tokenizer(inputs, max_length=data_args.max_source_length, padding=padding, truncation=True)
+
+        # Setup the tokenizer for targets
+        # with tokenizer.as_target_tokenizer():
+        #     labels = tokenizer(targets, max_length=max_target_length, padding=padding, truncation=True)
+
+        # If we are padding here, replace all tokenizer.pad_token_id in the labels by -100 when we want to ignore
+        # padding in the loss.
+        # if padding == "max_length" and data_args.ignore_pad_token_for_loss:
+        #     labels["input_ids"] = [
+        #         [(l if l != tokenizer.pad_token_id else -100) for l in label] for label in labels["input_ids"]
+        #     ]
+
+        model_inputs["labels"] = targets
+        return model_inputs
+
     if training_args.do_train:
         if "train" not in raw_datasets:
             raise ValueError("--do_train requires a train dataset")
@@ -522,6 +557,23 @@ def main():
                 remove_columns=column_names,
                 load_from_cache_file=not data_args.overwrite_cache,
                 desc="Running tokenizer on train dataset",
+            )
+
+    if data_args.train_ex:
+        if "train_ex" not in raw_datasets:
+            raise ValueError("--train_ex requires a train_ex dataset")
+        train_dataset_ex = raw_datasets["train_ex"]
+        if data_args.max_train_samples is not None:
+            max_train_samples = min(len(train_dataset_ex), data_args.max_train_samples)
+            train_dataset_ex = train_dataset_ex.select(range(max_train_samples))
+        with training_args.main_process_first(desc="train_ex dataset map pre-processing"):
+            train_dataset_ex = train_dataset_ex.map(
+                preprocess_function_ex,
+                batched=True,
+                num_proc=data_args.preprocessing_num_workers,
+                remove_columns=column_names,
+                load_from_cache_file=not data_args.overwrite_cache,
+                desc="Running tokenizer on train_ex dataset",
             )
 
     if training_args.do_eval:
@@ -568,6 +620,12 @@ def main():
         label_pad_token_id=label_pad_token_id,
         pad_to_multiple_of=8 if training_args.fp16 else None,
     )
+    data_collator_ex = DataCollatorWithPaddingClassification(
+        tokenizer,
+        # model=model,
+        # label_pad_token_id=label_pad_token_id,
+        pad_to_multiple_of=8 if training_args.fp16 else None,
+    )
 
     # Metric
     metric = load_metric("rouge")
@@ -605,15 +663,24 @@ def main():
         return result
 
     # Initialize our Trainer
-    trainer = Seq2SeqTrainer(
-        model=model,
-        args=training_args,
-        train_dataset=train_dataset if training_args.do_train else None,
-        eval_dataset=eval_dataset if training_args.do_eval else None,
-        tokenizer=tokenizer,
-        data_collator=data_collator,
-        compute_metrics=compute_metrics if training_args.predict_with_generate else None,
-    )
+    # trainer = Seq2SeqTrainer(
+    #     model=model,
+    #     args=training_args,
+    #     train_dataset=train_dataset if training_args.do_train else None,
+    #     eval_dataset=eval_dataset if training_args.do_eval else None,
+    #     tokenizer=tokenizer,
+    #     data_collator=data_collator,
+    #     compute_metrics=compute_metrics if training_args.predict_with_generate else None,
+    # )
+
+    trainer = MultiTrainer(model=model, args=training_args,
+                           train_dataset=train_dataset if training_args.do_train else None,
+                           train_dataset_ex=train_dataset_ex if data_args.train_ex else None,
+                           eval_dataset=eval_dataset if training_args.do_eval else None,
+                           tokenizer=tokenizer,
+                           data_collator=data_collator,
+                           data_collator_ex=data_collator_ex,
+                           compute_metrics=compute_metrics if training_args.predict_with_generate else None,)
 
     # Training
     if training_args.do_train:
@@ -645,7 +712,7 @@ def main():
     num_beams = data_args.num_beams if data_args.num_beams is not None else training_args.generation_num_beams
     if training_args.do_eval:
         logger.info("*** Evaluate ***")
-        metrics = trainer.evaluate(max_length=max_length, num_beams=num_beams, metric_key_prefix="eval")
+        metrics = trainer.seq_evaluate(max_length=max_length, num_beams=num_beams, metric_key_prefix="eval")
         max_eval_samples = data_args.max_eval_samples if data_args.max_eval_samples is not None else len(eval_dataset)
         metrics["eval_samples"] = min(max_eval_samples, len(eval_dataset))
 
