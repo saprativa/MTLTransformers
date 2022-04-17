@@ -1634,8 +1634,10 @@ class MultiTrainer:
             num_update_steps_per_epoch = full_length // args.gradient_accumulation_steps
             num_update_steps_per_epoch = max(num_update_steps_per_epoch, 1)
             
-            # num_examples = self.num_examples(train_dataloader)
-            num_examples = max_task_samples 
+            num_examples = self.num_examples(train_dataloader)
+            if train_dataloader_ex is not None:
+                num_examples += self.num_examples(train_dataloader_ex)
+            
             if args.max_steps > 0:
                 max_steps = args.max_steps
                 num_train_epochs = args.max_steps // num_update_steps_per_epoch + int(
@@ -2108,7 +2110,7 @@ class MultiTrainer:
             self._report_to_hp_search(trial, epoch, metrics)
 
         if self.control.should_save:
-            self._save_checkpoint(model, trial, metrics=metrics)
+            self._save_checkpoint(model, trial, metrics=metrics, epoch=epoch)
             self.control = self.callback_handler.on_save(self.args, self.state, self.control)
 
     def _load_rng_state(self, checkpoint):
@@ -2152,13 +2154,18 @@ class MultiTrainer:
         if is_torch_tpu_available():
             xm.set_rng_state(checkpoint_rng_state["xla"])
 
-    def _save_checkpoint(self, model, trial, metrics=None):
+    def _save_checkpoint(self, model, trial, metrics=None, epoch=None):
         # In all cases, including ddp/dp/deepspeed, self.model is always a reference to the model we
         # want to save except FullyShardedDDP.
         # assert unwrap_model(model) is self.model, "internal model should be a reference to self.model"
 
         # Save model checkpoint
-        checkpoint_folder = f"{PREFIX_CHECKPOINT_DIR}-{self.state.global_step}"
+        # checkpoint_folder = f"{PREFIX_CHECKPOINT_DIR}-{self.state.global_step}"
+
+        if epoch is None:
+            checkpoint_folder = f"{PREFIX_CHECKPOINT_DIR}-{self.state.global_step}"
+        else:
+            checkpoint_folder = f"{PREFIX_CHECKPOINT_DIR}-{epoch}"
 
         if self.hp_search_backend is not None and trial is not None:
             if self.hp_search_backend == HPSearchBackend.OPTUNA:
