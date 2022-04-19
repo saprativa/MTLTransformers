@@ -32,6 +32,14 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, Un
 
 from tqdm.auto import tqdm
 
+import threading
+import torch
+from torch.cuda._utils import _get_device_index
+from torch.cuda.amp import autocast
+from torch._utils import ExceptionWrapper
+
+from itertools import chain
+
 
 # Integrations must be imported before ML frameworks:
 from transformers.integrations import (  # isort: split
@@ -195,6 +203,166 @@ OPTIMIZER_NAME = "optimizer.pt"
 SCHEDULER_NAME = "scheduler.pt"
 SCALER_NAME = "scaler.pt"
 
+#########################################################################################################################
+def get_a_var(obj):
+    if isinstance(obj, torch.Tensor):
+        return obj
+
+    if isinstance(obj, list) or isinstance(obj, tuple):
+        for result in map(get_a_var, obj):
+            if isinstance(result, torch.Tensor):
+                return result
+    if isinstance(obj, dict):
+        for result in map(get_a_var, obj.items()):
+            if isinstance(result, torch.Tensor):
+                return result
+    return None
+
+
+def parallel_apply(modules, inputs, kwargs_tup=None, devices=None):
+    assert len(modules) == len(inputs)
+    if kwargs_tup is not None:
+        assert len(modules) == len(kwargs_tup)
+    else:
+        kwargs_tup = ({},) * len(modules)
+    if devices is not None:
+        assert len(modules) == len(devices)
+    else:
+        devices = [None] * len(modules)
+    devices = [_get_device_index(x, True) for x in devices]
+    lock = threading.Lock()
+    results = {}
+    grad_enabled, autocast_enabled = torch.is_grad_enabled(), torch.is_autocast_enabled()
+
+    def _worker(i, module, input, kwargs, device=None):
+        torch.set_grad_enabled(grad_enabled)
+        if device is None:
+            device = get_a_var(input).get_device()
+        try:
+            with torch.cuda.device(device), autocast(enabled=autocast_enabled):
+                # this also avoids accidental slicing of `input` if it is a Tensor
+                if not isinstance(input, (list, tuple)):
+                    input = (input,)
+                output = module(*input, **kwargs)
+            with lock:
+                results[i] = output
+        except Exception:
+            with lock:
+                results[i] = ExceptionWrapper(
+                    where="in replica {} on device {}".format(i, device))
+
+    if len(modules) > 1:
+        threads = [threading.Thread(target=_worker,
+                                    args=(i, module, input, kwargs, device))
+                   for i, (module, input, kwargs, device) in
+                   enumerate(zip(modules, inputs, kwargs_tup, devices))]
+
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+    else:
+        _worker(0, modules[0], inputs[0], kwargs_tup[0], devices[0])
+
+    outputs = []
+    for i in range(len(inputs)):
+        output = results[i]
+        if isinstance(output, ExceptionWrapper):
+            output.reraise()
+        outputs.append(output)
+    return outputs
+
+def parallel_apply_ex(modules, inputs, kwargs_tup=None, devices=None):
+    assert len(modules) == len(inputs)
+    if kwargs_tup is not None:
+        assert len(modules) == len(kwargs_tup)
+    else:
+        kwargs_tup = ({},) * len(modules)
+    if devices is not None:
+        assert len(modules) == len(devices)
+    else:
+        devices = [None] * len(modules)
+    devices = [_get_device_index(x, True) for x in devices]
+    lock = threading.Lock()
+    results = {}
+    grad_enabled, autocast_enabled = torch.is_grad_enabled(), torch.is_autocast_enabled()
+
+    def _worker(i, module, input, kwargs, device=None):
+        torch.set_grad_enabled(grad_enabled)
+        if device is None:
+            device = get_a_var(input).get_device()
+        try:
+            with torch.cuda.device(device), autocast(enabled=autocast_enabled):
+                # this also avoids accidental slicing of `input` if it is a Tensor
+                if not isinstance(input, (list, tuple)):
+                    input = (input,)
+                output = module.forward_ex(*input, **kwargs)
+            with lock:
+                results[i] = output
+        except Exception:
+            with lock:
+                results[i] = ExceptionWrapper(
+                    where="in replica {} on device {}".format(i, device))
+
+    if len(modules) > 1:
+        threads = [threading.Thread(target=_worker,
+                                    args=(i, module, input, kwargs, device))
+                   for i, (module, input, kwargs, device) in
+                   enumerate(zip(modules, inputs, kwargs_tup, devices))]
+
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+    else:
+        _worker(0, modules[0], inputs[0], kwargs_tup[0], devices[0])
+
+    outputs = []
+    for i in range(len(inputs)):
+        output = results[i]
+        if isinstance(output, ExceptionWrapper):
+            output.reraise()
+        outputs.append(output)
+    return outputs
+
+
+class MultiDataParallel(torch.nn.DataParallel):
+    def __init__(self, module, device_ids=None, output_device=None, dim=0):
+        super(MultiDataParallel, self).__init__(module)#, device_ids=[0, 1])
+
+
+    def parallel_apply(self, replicas, inputs, kwargs):
+        return parallel_apply(replicas, inputs, kwargs, self.device_ids[:len(replicas)])
+
+    def parallel_apply_ex(self, replicas, inputs, kwargs):
+        return parallel_apply_ex(replicas, inputs, kwargs, self.device_ids[:len(replicas)])
+
+    def forward_ex(self, *inputs, **kwargs):
+        if not self.device_ids:
+            return self.module.forward_ex(*inputs, **kwargs)
+
+        for t in chain(self.module.parameters(), self.module.buffers()):
+            if t.device != self.src_device_obj:
+                raise RuntimeError("module must have its parameters and buffers "
+                                   "on device {} (device_ids[0]) but found one of "
+                                   "them on device: {}".format(self.src_device_obj, t.device))
+
+        inputs, kwargs = self.scatter(inputs, kwargs, self.device_ids)
+        # for forward function without any inputs, empty list and dict will be created
+        # so the module can be executed on one device which is the first one in device_ids
+        if not inputs and not kwargs:
+            inputs = ((),)
+            kwargs = ({},)
+
+        if len(self.device_ids) == 1:
+            return self.module.forward_ex(*inputs[0], **kwargs[0])
+        replicas = self.replicate(self.module, self.device_ids[:len(inputs)])
+        outputs = self.parallel_apply_ex(replicas, inputs, kwargs)
+        return self.gather(outputs, self.output_device)
+
+
+
+#########################################################################################################################
 
 class MultiTrainer:
     """
@@ -603,6 +771,7 @@ class MultiTrainer:
         else:
             return dataset.remove_columns(ignored_columns)
 
+######################### Abstractive ################################################################################
     def _get_train_sampler(self) -> Optional[torch.utils.data.Sampler]:
         if self.train_dataset is None or not has_length(self.train_dataset):
             return None
@@ -797,7 +966,206 @@ class MultiTrainer:
             num_workers=self.args.dataloader_num_workers,
             pin_memory=self.args.dataloader_pin_memory,
         )
+################## Extractive #############################################################################
+    def _get_train_sampler_ex(self) -> Optional[torch.utils.data.Sampler]:
+        if self.train_dataset_ex is None or not has_length(self.train_dataset_ex):
+            return None
 
+        generator = None
+        if self.args.world_size <= 1 and _is_torch_generator_available:
+            generator = torch.Generator()
+            # for backwards compatibility, we generate a seed here (which is sampled from a generator seeded with
+            # `args.seed`) if data_seed isn't provided.
+            # Further on in this method, we default to `args.seed` instead.
+            if self.args.data_seed is None:
+                seed = int(torch.empty((), dtype=torch.int64).random_().item())
+            else:
+                seed = self.args.data_seed
+            generator.manual_seed(seed)
+
+        seed = self.args.data_seed if self.args.data_seed is not None else self.args.seed
+
+        # Build the sampler.
+        if self.args.group_by_length:
+            if is_datasets_available() and isinstance(self.train_dataset_ex, datasets.Dataset):
+                lengths = (
+                    self.train_dataset_ex[self.args.length_column_name]
+                    if self.args.length_column_name in self.train_dataset_ex.column_names
+                    else None
+                )
+            else:
+                lengths = None
+            model_input_name = self.tokenizer.model_input_names[0] if self.tokenizer is not None else None
+            if self.args.world_size <= 1:
+                return LengthGroupedSampler(
+                    self.args.train_batch_size * self.args.gradient_accumulation_steps,
+                    dataset=self.train_dataset_ex,
+                    lengths=lengths,
+                    model_input_name=model_input_name,
+                    generator=generator,
+                )
+            else:
+                return DistributedLengthGroupedSampler(
+                    self.args.train_batch_size * self.args.gradient_accumulation_steps,
+                    dataset=self.train_dataset_ex,
+                    num_replicas=self.args.world_size,
+                    rank=self.args.process_index,
+                    lengths=lengths,
+                    model_input_name=model_input_name,
+                    seed=seed,
+                )
+
+        else:
+            if self.args.world_size <= 1:
+                if _is_torch_generator_available:
+                    return RandomSampler(self.train_dataset_ex, generator=generator)
+                return RandomSampler(self.train_dataset_ex)
+            elif (
+                self.args.parallel_mode in [ParallelMode.TPU, ParallelMode.SAGEMAKER_MODEL_PARALLEL]
+                and not self.args.dataloader_drop_last
+            ):
+                # Use a loop for TPUs when drop_last is False to have all batches have the same size.
+                return DistributedSamplerWithLoop(
+                    self.train_dataset_ex,
+                    batch_size=self.args.per_device_train_batch_size,
+                    num_replicas=self.args.world_size,
+                    rank=self.args.process_index,
+                    seed=seed,
+                )
+            else:
+                return DistributedSampler(
+                    self.train_dataset_ex,
+                    num_replicas=self.args.world_size,
+                    rank=self.args.process_index,
+                    seed=seed,
+                )
+
+    def get_train_dataloader_ex(self) -> DataLoader:
+        """
+        Returns the training [`~torch.utils.data.DataLoader`].
+
+        Will use no sampler if `train_dataset` does not implement `__len__`, a random sampler (adapted to distributed
+        training if necessary) otherwise.
+
+        Subclass and override this method if you want to inject some custom behavior.
+        """
+        if self.train_dataset_ex is None:
+            raise ValueError("Trainer: training requires a train_dataset_ex.")
+
+        train_dataset_ex = self.train_dataset_ex
+        if is_datasets_available() and isinstance(train_dataset_ex, datasets.Dataset):
+            train_dataset_ex = self._remove_unused_columns(train_dataset_ex, description="training")
+
+        if isinstance(train_dataset_ex, torch.utils.data.IterableDataset):
+            if self.args.world_size > 1:
+                train_dataset_ex = IterableDatasetShard(
+                    train_dataset_ex,
+                    batch_size=self.args.train_batch_size,
+                    drop_last=self.args.dataloader_drop_last,
+                    num_processes=self.args.world_size,
+                    process_index=self.args.process_index,
+                )
+
+            return DataLoader(
+                train_dataset_ex,
+                batch_size=self.args.per_device_train_batch_size,
+                collate_fn=self.data_collator_ex,
+                num_workers=self.args.dataloader_num_workers,
+                pin_memory=self.args.dataloader_pin_memory,
+            )
+
+        train_sampler_ex = self._get_train_sampler_ex()
+
+        return DataLoader(
+            train_dataset_ex,
+            batch_size=self.args.train_batch_size,
+            sampler=train_sampler_ex,
+            collate_fn=self.data_collator_ex,
+            drop_last=self.args.dataloader_drop_last,
+            num_workers=self.args.dataloader_num_workers,
+            pin_memory=self.args.dataloader_pin_memory,
+        )
+
+    def _get_eval_sampler_ex(self, eval_dataset: Dataset) -> Optional[torch.utils.data.Sampler]:
+        # Deprecated code
+        if self.args.use_legacy_prediction_loop:
+            if is_torch_tpu_available():
+                return SequentialDistributedSampler(
+                    eval_dataset, num_replicas=xm.xrt_world_size(), rank=xm.get_ordinal()
+                )
+            elif is_sagemaker_mp_enabled():
+                return SequentialDistributedSampler(
+                    eval_dataset,
+                    num_replicas=smp.dp_size(),
+                    rank=smp.dp_rank(),
+                    batch_size=self.args.per_device_eval_batch_size,
+                )
+            elif self.args.local_rank != -1:
+                return SequentialDistributedSampler(eval_dataset)
+            else:
+                return SequentialSampler(eval_dataset)
+
+        if self.args.world_size <= 1:
+            return SequentialSampler(eval_dataset)
+        else:
+            return ShardSampler(
+                eval_dataset,
+                batch_size=self.args.per_device_eval_batch_size,
+                num_processes=self.args.world_size,
+                process_index=self.args.process_index,
+            )
+
+    def get_eval_dataloader_ex(self, eval_dataset: Optional[Dataset] = None) -> DataLoader:
+        """
+        Returns the evaluation [`~torch.utils.data.DataLoader`].
+
+        Subclass and override this method if you want to inject some custom behavior.
+
+        Args:
+            eval_dataset (`torch.utils.data.Dataset`, *optional*):
+                If provided, will override `self.eval_dataset`. If it is an `datasets.Dataset`, columns not accepted by
+                the `model.forward()` method are automatically removed. It must implement `__len__`.
+        """
+        if eval_dataset is None and self.eval_dataset is None:
+            raise ValueError("Trainer: evaluation requires an eval_dataset.")
+        eval_dataset = eval_dataset if eval_dataset is not None else self.eval_dataset
+
+        if is_datasets_available() and isinstance(eval_dataset, datasets.Dataset):
+            eval_dataset = self._remove_unused_columns(eval_dataset, description="evaluation")
+
+        if isinstance(eval_dataset, torch.utils.data.IterableDataset):
+            if self.args.world_size > 1:
+                eval_dataset = IterableDatasetShard(
+                    eval_dataset,
+                    batch_size=self.args.per_device_eval_batch_size,
+                    drop_last=self.args.dataloader_drop_last,
+                    num_processes=self.args.world_size,
+                    process_index=self.args.process_index,
+                )
+            return DataLoader(
+                eval_dataset,
+                batch_size=self.args.eval_batch_size,
+                collate_fn=self.data_collator_ex,
+                num_workers=self.args.dataloader_num_workers,
+                pin_memory=self.args.dataloader_pin_memory,
+            )
+
+        eval_sampler = self._get_eval_sampler(eval_dataset)
+
+        return DataLoader(
+            eval_dataset,
+            sampler=eval_sampler,
+            batch_size=self.args.eval_batch_size,
+            collate_fn=self.data_collator_ex,
+            drop_last=self.args.dataloader_drop_last,
+            num_workers=self.args.dataloader_num_workers,
+            pin_memory=self.args.dataloader_pin_memory,
+        )
+    
+    
+    
+    
+############################################################################################################    
     def get_test_dataloader(self, test_dataset: Dataset) -> DataLoader:
         """
         Returns the test [`~torch.utils.data.DataLoader`].
@@ -1071,7 +1439,8 @@ class MultiTrainer:
 
         # Multi-gpu training (should be after apex fp16 initialization)
         if self.args.n_gpu > 1:
-            model = nn.DataParallel(model)
+            # model = nn.DataParallel(model)
+            model = MultiDataParallel(model)
 
         # Note: in torch.distributed mode, there's no point in wrapping the model
         # inside a DistributedDataParallel as we'll be under `no_grad` anyways.
@@ -1147,6 +1516,8 @@ class MultiTrainer:
                 Additional keyword arguments used to hide deprecated arguments
         """
         resume_from_checkpoint = None if not resume_from_checkpoint else resume_from_checkpoint
+
+        sum_loss = True
 
         # memory metrics - must set up as early as possible
         self._memory_tracker.start()
@@ -1225,6 +1596,11 @@ class MultiTrainer:
         # Data loader and number of training steps
         train_dataloader = self.get_train_dataloader()
 
+        if self.train_dataset_ex is not None:
+            train_dataloader_ex = self.get_train_dataloader_ex()
+        else:
+            train_dataloader_ex = None
+
         # Setting up training control variables:
         # number of training epochs: num_train_epochs
         # number of training steps per epoch: num_update_steps_per_epoch
@@ -1233,10 +1609,35 @@ class MultiTrainer:
 
         len_dataloader = None
         if has_length(train_dataloader):
+            full_length = 0
+            max_task_samples = 0
+            num_tasks = 1
             len_dataloader = len(train_dataloader)
-            num_update_steps_per_epoch = len_dataloader // args.gradient_accumulation_steps
+
+            if train_dataloader is not None:
+                full_length += len(train_dataloader)
+                if len(train_dataloader) > max_task_samples:
+                    max_task_samples = len(train_dataloader)
+
+            if train_dataloader_ex is not None:
+                num_tasks += 1
+                full_length += len(train_dataloader_ex)
+                if len(train_dataloader_ex) > max_task_samples:
+                    max_task_samples = len(train_dataloader_ex)
+
+            if sum_loss is True:
+                full_length = max_task_samples
+            else:
+                full_length = num_tasks * max_task_samples
+            
+            # num_update_steps_per_epoch = len_dataloader // args.gradient_accumulation_steps
+            num_update_steps_per_epoch = full_length // args.gradient_accumulation_steps
             num_update_steps_per_epoch = max(num_update_steps_per_epoch, 1)
+            
             num_examples = self.num_examples(train_dataloader)
+            if train_dataloader_ex is not None:
+                num_examples += self.num_examples(train_dataloader_ex)
+            
             if args.max_steps > 0:
                 max_steps = args.max_steps
                 num_train_epochs = args.max_steps // num_update_steps_per_epoch + int(
@@ -1329,7 +1730,9 @@ class MultiTrainer:
             os.path.join(resume_from_checkpoint, TRAINER_STATE_NAME)
         ):
             self.state = TrainerState.load_from_json(os.path.join(resume_from_checkpoint, TRAINER_STATE_NAME))
-            epochs_trained = self.state.global_step // num_update_steps_per_epoch
+            # epochs_trained = self.state.global_step // num_update_steps_per_epoch
+            epochs_trained = int(round(self.state.epoch))
+            self.state.global_step = epochs_trained * num_update_steps_per_epoch
             if not args.ignore_data_skip:
                 steps_trained_in_current_epoch = self.state.global_step % (num_update_steps_per_epoch)
                 steps_trained_in_current_epoch *= args.gradient_accumulation_steps
@@ -1354,6 +1757,7 @@ class MultiTrainer:
         self.callback_handler.optimizer = self.optimizer
         self.callback_handler.lr_scheduler = self.lr_scheduler
         self.callback_handler.train_dataloader = train_dataloader
+        self.callback_handler.train_dataloader_ex = train_dataloader_ex
         self.state.trial_name = self.hp_name(trial) if self.hp_name is not None else None
         if trial is not None:
             assignments = trial.assignments if self.hp_search_backend == HPSearchBackend.SIGOPT else trial
@@ -1392,159 +1796,217 @@ class MultiTrainer:
                     # AT THE VERY END!
                     _ = list(train_dataloader.sampler)
 
-        for epoch in range(epochs_trained, num_train_epochs):
-            if isinstance(train_dataloader, DataLoader) and isinstance(train_dataloader.sampler, DistributedSampler):
-                train_dataloader.sampler.set_epoch(epoch)
-            elif hasattr(train_dataloader, "dataset") and isinstance(train_dataloader.dataset, IterableDatasetShard):
-                train_dataloader.dataset.set_epoch(epoch)
+        if sum_loss is True:
+            for epoch in range(epochs_trained, num_train_epochs):
+                all_epoch_iterator_steps = 0
+                len_abs_samples = 0
+                len_ex_samples = 0
+                abs_samples = []
+                ex_samples = []
 
-            if is_torch_tpu_available():
-                parallel_loader = pl.ParallelLoader(train_dataloader, [args.device]).per_device_loader(args.device)
-                epoch_iterator = parallel_loader
-            else:
+                ############### Abs Iterator ##################################
+                
+                if isinstance(train_dataloader, DataLoader) and isinstance(train_dataloader.sampler, DistributedSampler):
+                    train_dataloader.sampler.set_epoch(epoch)
+                elif hasattr(train_dataloader, "dataset") and isinstance(train_dataloader.dataset, IterableDatasetShard):
+                    train_dataloader.dataset.set_epoch(epoch)
+
                 epoch_iterator = train_dataloader
+                len_abs_samples = len(epoch_iterator)
+                abs_samples = [x for x in epoch_iterator]
+                all_epoch_iterator_steps += len(epoch_iterator)
 
-            # Reset the past mems state at the beginning of each epoch if necessary.
-            if args.past_index >= 0:
-                self._past = None
+                ############### Ext Iterator ##################################
 
-            steps_in_epoch = (
-                len(epoch_iterator)
-                if len_dataloader is not None
-                else args.max_steps * args.gradient_accumulation_steps
-            )
-            self.control = self.callback_handler.on_epoch_begin(args, self.state, self.control)
+                if train_dataloader_ex is not None:
+                    if isinstance(train_dataloader_ex, DataLoader) and isinstance(train_dataloader_ex.sampler, DistributedSampler):
+                        train_dataloader_ex.sampler.set_epoch(epoch)
+                    elif hasattr(train_dataloader_ex, "dataset") and isinstance(train_dataloader_ex.dataset, IterableDatasetShard):
+                        train_dataloader_ex.dataset.set_epoch(epoch)
 
-            step = -1
-            for step, inputs in enumerate(epoch_iterator):
-
-                # Skip past any already trained steps if resuming training
-                if steps_trained_in_current_epoch > 0:
-                    steps_trained_in_current_epoch -= 1
-                    if steps_trained_progress_bar is not None:
-                        steps_trained_progress_bar.update(1)
-                    if steps_trained_in_current_epoch == 0:
-                        self._load_rng_state(resume_from_checkpoint)
-                    continue
-                elif steps_trained_progress_bar is not None:
-                    steps_trained_progress_bar.close()
-                    steps_trained_progress_bar = None
-
-                if step % args.gradient_accumulation_steps == 0:
-                    self.control = self.callback_handler.on_step_begin(args, self.state, self.control)
-
-                if (
-                    ((step + 1) % args.gradient_accumulation_steps != 0)
-                    and args.local_rank != -1
-                    and args._no_sync_in_gradient_accumulation
-                ):
-                    # Avoid unnecessary DDP synchronization since there will be no backward pass on this example.
-                    with model.no_sync():
-                        tr_loss_step = self.training_step(model, inputs)
+                    ex_epoch_iterator = train_dataloader_ex
+                    len_ex_samples = len(ex_epoch_iterator)
+                    ex_samples = [x for x in ex_epoch_iterator]
+                    all_epoch_iterator_steps += len(ex_epoch_iterator)
                 else:
-                    tr_loss_step = self.training_step(model, inputs)
+                    ex_epoch_iterator = None
 
-                if (
-                    args.logging_nan_inf_filter
-                    and not is_torch_tpu_available()
-                    and (torch.isnan(tr_loss_step) or torch.isinf(tr_loss_step))
-                ):
-                    # if loss is nan or inf simply add the average of previous logged losses
-                    tr_loss += tr_loss / (1 + self.state.global_step - self._globalstep_last_logged)
-                else:
-                    tr_loss += tr_loss_step
 
-                self.current_flos += float(self.floating_point_ops(inputs))
+                # if is_torch_tpu_available():
+                #     parallel_loader = pl.ParallelLoader(train_dataloader, [args.device]).per_device_loader(args.device)
+                #     epoch_iterator = parallel_loader
+                # else:
+                #     epoch_iterator = train_dataloader
 
-                # Optimizer step for deepspeed must be called on every step regardless of the value of gradient_accumulation_steps
-                if self.deepspeed:
-                    self.deepspeed.step()
+                # Reset the past mems state at the beginning of each epoch if necessary.
+                if args.past_index >= 0:
+                    self._past = None
 
-                if (step + 1) % args.gradient_accumulation_steps == 0 or (
-                    # last step in epoch but step is always smaller than gradient_accumulation_steps
-                    steps_in_epoch <= args.gradient_accumulation_steps
-                    and (step + 1) == steps_in_epoch
-                ):
-                    # Gradient clipping
-                    if args.max_grad_norm is not None and args.max_grad_norm > 0 and not self.deepspeed:
-                        # deepspeed does its own clipping
+                max_task_steps = max([len_abs_samples, len_ex_samples])
+                num_tasks = 1
+                while len(abs_samples) < max_task_steps:
+                    rand_idx = random.randint(0, len_abs_samples - 1)
+                    abs_samples.append(abs_samples[rand_idx])
+                random.shuffle(abs_samples)
 
-                        if self.do_grad_scaling:
-                            # Reduce gradients first for XLA
-                            if is_torch_tpu_available():
-                                gradients = xm._fetch_gradients(self.optimizer)
-                                xm.all_reduce("sum", gradients, scale=1.0 / xm.xrt_world_size())
-                            # AMP: gradients need unscaling
-                            self.scaler.unscale_(self.optimizer)
+                if len(ex_samples) > 0:
+                    num_tasks += 1
+                    while len(ex_samples) < max_task_steps:
+                        rand_idx = random.randint(0, len_ex_samples - 1)
+                        ex_samples.append(ex_samples[rand_idx])
+                random.shuffle(ex_samples)
 
-                        if hasattr(self.optimizer, "clip_grad_norm"):
-                            # Some optimizers (like the sharded optimizer) have a specific way to do gradient clipping
-                            self.optimizer.clip_grad_norm(args.max_grad_norm)
-                        elif hasattr(model, "clip_grad_norm_"):
-                            # Some models (like FullyShardedDDP) have a specific way to do gradient clipping
-                            model.clip_grad_norm_(args.max_grad_norm)
-                        else:
-                            # Revert to normal clipping otherwise, handling Apex or full precision
-                            nn.utils.clip_grad_norm_(
-                                amp.master_params(self.optimizer) if self.use_apex else model.parameters(),
-                                args.max_grad_norm,
-                            )
+                steps_in_epoch = (
+                    max_task_steps
+                    if len_dataloader is not None
+                    else args.max_steps * args.gradient_accumulation_steps
+                )
+                self.control = self.callback_handler.on_epoch_begin(args, self.state, self.control)
 
-                    # Optimizer step
-                    optimizer_was_run = True
+                step = -1
+                for step, inputs in enumerate(abs_samples):
+
+                    # Skip past any already trained steps if resuming training
+                    if steps_trained_in_current_epoch > 0:
+                        steps_trained_in_current_epoch -= 1
+                        if steps_trained_progress_bar is not None:
+                            steps_trained_progress_bar.update(1)
+                        if steps_trained_in_current_epoch == 0:
+                            self._load_rng_state(resume_from_checkpoint)
+                        continue
+                    elif steps_trained_progress_bar is not None:
+                        steps_trained_progress_bar.close()
+                        steps_trained_progress_bar = None
+
+                    if step % args.gradient_accumulation_steps == 0:
+                        self.control = self.callback_handler.on_step_begin(args, self.state, self.control)
+                    
+                    tr_loss_step = None
+                    if (
+                        ((step + 1) % args.gradient_accumulation_steps != 0)
+                        and args.local_rank != -1
+                        and args._no_sync_in_gradient_accumulation
+                    ):
+                        # Avoid unnecessary DDP synchronization since there will be no backward pass on this example.
+                        with model.no_sync():
+                            tr_loss_step = self.training_step(model, inputs, do_backward=False)
+
+                            if len(ex_samples) > 0:
+                                ex_inputs = ex_samples[step]
+                                tr_loss_step += self.training_step_ex(model, ex_inputs, do_backward=False)
+
+                    else:
+                        tr_loss_step = self.training_step(model, inputs, do_backward=False)
+
+                        if len(ex_samples) > 0:
+                                ex_inputs = ex_samples[step]
+                                tr_loss_step += self.training_step_ex(model, ex_inputs, do_backward=False)
+
+                    tr_loss_step = tr_loss_step/num_tasks
+                    tr_loss_step.backward()
+                    tr_loss += tr_loss_step.detach()
+
+                    # if (
+                    #     args.logging_nan_inf_filter
+                    #     and not is_torch_tpu_available()
+                    #     and (torch.isnan(tr_loss_step) or torch.isinf(tr_loss_step))
+                    # ):
+                    #     # if loss is nan or inf simply add the average of previous logged losses
+                    #     tr_loss += tr_loss / (1 + self.state.global_step - self._globalstep_last_logged)
+                    # else:
+                    #     tr_loss += tr_loss_step
+
+                    self.current_flos += float(self.floating_point_ops(inputs))
+
+                    # Optimizer step for deepspeed must be called on every step regardless of the value of gradient_accumulation_steps
                     if self.deepspeed:
-                        pass  # called outside the loop
-                    elif is_torch_tpu_available():
-                        if self.do_grad_scaling:
+                        self.deepspeed.step()
+
+                    if (step + 1) % args.gradient_accumulation_steps == 0 or (
+                        # last step in epoch but step is always smaller than gradient_accumulation_steps
+                        steps_in_epoch <= args.gradient_accumulation_steps
+                        and (step + 1) == steps_in_epoch
+                    ):
+                        # Gradient clipping
+                        if args.max_grad_norm is not None and args.max_grad_norm > 0 and not self.deepspeed:
+                            # deepspeed does its own clipping
+
+                            if self.do_grad_scaling:
+                                # Reduce gradients first for XLA
+                                if is_torch_tpu_available():
+                                    gradients = xm._fetch_gradients(self.optimizer)
+                                    xm.all_reduce("sum", gradients, scale=1.0 / xm.xrt_world_size())
+                                # AMP: gradients need unscaling
+                                self.scaler.unscale_(self.optimizer)
+
+                            if hasattr(self.optimizer, "clip_grad_norm"):
+                                # Some optimizers (like the sharded optimizer) have a specific way to do gradient clipping
+                                self.optimizer.clip_grad_norm(args.max_grad_norm)
+                            elif hasattr(model, "clip_grad_norm_"):
+                                # Some models (like FullyShardedDDP) have a specific way to do gradient clipping
+                                model.clip_grad_norm_(args.max_grad_norm)
+                            else:
+                                # Revert to normal clipping otherwise, handling Apex or full precision
+                                nn.utils.clip_grad_norm_(
+                                    amp.master_params(self.optimizer) if self.use_apex else model.parameters(),
+                                    args.max_grad_norm,
+                                )
+
+                        # Optimizer step
+                        optimizer_was_run = True
+                        if self.deepspeed:
+                            pass  # called outside the loop
+                        elif is_torch_tpu_available():
+                            if self.do_grad_scaling:
+                                self.scaler.step(self.optimizer)
+                                self.scaler.update()
+                            else:
+                                xm.optimizer_step(self.optimizer)
+                        elif self.do_grad_scaling:
+                            scale_before = self.scaler.get_scale()
                             self.scaler.step(self.optimizer)
                             self.scaler.update()
+                            scale_after = self.scaler.get_scale()
+                            optimizer_was_run = scale_before <= scale_after
                         else:
-                            xm.optimizer_step(self.optimizer)
-                    elif self.do_grad_scaling:
-                        scale_before = self.scaler.get_scale()
-                        self.scaler.step(self.optimizer)
-                        self.scaler.update()
-                        scale_after = self.scaler.get_scale()
-                        optimizer_was_run = scale_before <= scale_after
+                            self.optimizer.step()
+
+                        if optimizer_was_run and not self.deepspeed:
+                            self.lr_scheduler.step()
+
+                        model.zero_grad()
+                        self.state.global_step += 1
+                        self.state.epoch = epoch + (step + 1) / steps_in_epoch
+                        self.control = self.callback_handler.on_step_end(args, self.state, self.control)
+
+                        self._maybe_log_save_evaluate(tr_loss, model, trial, epoch, ignore_keys_for_eval)
                     else:
-                        self.optimizer.step()
+                        self.control = self.callback_handler.on_substep_end(args, self.state, self.control)
 
-                    if optimizer_was_run and not self.deepspeed:
-                        self.lr_scheduler.step()
-
-                    model.zero_grad()
-                    self.state.global_step += 1
-                    self.state.epoch = epoch + (step + 1) / steps_in_epoch
-                    self.control = self.callback_handler.on_step_end(args, self.state, self.control)
-
-                    self._maybe_log_save_evaluate(tr_loss, model, trial, epoch, ignore_keys_for_eval)
-                else:
-                    self.control = self.callback_handler.on_substep_end(args, self.state, self.control)
-
-                if self.control.should_epoch_stop or self.control.should_training_stop:
-                    break
-            if step < 0:
-                logger.warning(
-                    f"There seems to be not a single sample in your epoch_iterator, stopping training at step"
-                    f" {self.state.global_step}! This is expected if you're using an IterableDataset and set"
-                    f" num_steps ({max_steps}) higher than the number of available samples."
-                )
-                self.control.should_training_stop = True
-
-            self.control = self.callback_handler.on_epoch_end(args, self.state, self.control)
-            self._maybe_log_save_evaluate(tr_loss, model, trial, epoch, ignore_keys_for_eval)
-
-            if DebugOption.TPU_METRICS_DEBUG in self.args.debug:
-                if is_torch_tpu_available():
-                    # tpu-comment: Logging debug metrics for PyTorch/XLA (compile, execute times, ops, etc.)
-                    xm.master_print(met.metrics_report())
-                else:
+                    if self.control.should_epoch_stop or self.control.should_training_stop:
+                        break
+                if step < 0:
                     logger.warning(
-                        "You enabled PyTorch/XLA debug metrics but you don't have a TPU "
-                        "configured. Check your training configuration if this is unexpected."
+                        f"There seems to be not a single sample in your epoch_iterator, stopping training at step"
+                        f" {self.state.global_step}! This is expected if you're using an IterableDataset and set"
+                        f" num_steps ({max_steps}) higher than the number of available samples."
                     )
-            if self.control.should_training_stop:
-                break
+                    self.control.should_training_stop = True
+
+                self.control = self.callback_handler.on_epoch_end(args, self.state, self.control)
+                self._maybe_log_save_evaluate(tr_loss, model, trial, epoch, ignore_keys_for_eval)
+
+                if DebugOption.TPU_METRICS_DEBUG in self.args.debug:
+                    if is_torch_tpu_available():
+                        # tpu-comment: Logging debug metrics for PyTorch/XLA (compile, execute times, ops, etc.)
+                        xm.master_print(met.metrics_report())
+                    else:
+                        logger.warning(
+                            "You enabled PyTorch/XLA debug metrics but you don't have a TPU "
+                            "configured. Check your training configuration if this is unexpected."
+                        )
+                if self.control.should_training_stop:
+                    break
 
         if args.past_index and hasattr(self, "_past"):
             # Clean the state at the end of training
@@ -1648,7 +2110,7 @@ class MultiTrainer:
             self._report_to_hp_search(trial, epoch, metrics)
 
         if self.control.should_save:
-            self._save_checkpoint(model, trial, metrics=metrics)
+            self._save_checkpoint(model, trial, metrics=metrics, epoch=epoch)
             self.control = self.callback_handler.on_save(self.args, self.state, self.control)
 
     def _load_rng_state(self, checkpoint):
@@ -1692,13 +2154,18 @@ class MultiTrainer:
         if is_torch_tpu_available():
             xm.set_rng_state(checkpoint_rng_state["xla"])
 
-    def _save_checkpoint(self, model, trial, metrics=None):
+    def _save_checkpoint(self, model, trial, metrics=None, epoch=None):
         # In all cases, including ddp/dp/deepspeed, self.model is always a reference to the model we
         # want to save except FullyShardedDDP.
         # assert unwrap_model(model) is self.model, "internal model should be a reference to self.model"
 
         # Save model checkpoint
-        checkpoint_folder = f"{PREFIX_CHECKPOINT_DIR}-{self.state.global_step}"
+        # checkpoint_folder = f"{PREFIX_CHECKPOINT_DIR}-{self.state.global_step}"
+
+        if epoch is None:
+            checkpoint_folder = f"{PREFIX_CHECKPOINT_DIR}-{self.state.global_step}"
+        else:
+            checkpoint_folder = f"{PREFIX_CHECKPOINT_DIR}-{epoch}"
 
         if self.hp_search_backend is not None and trial is not None:
             if self.hp_search_backend == HPSearchBackend.OPTUNA:
@@ -1955,6 +2422,7 @@ class MultiTrainer:
         self.state.log_history.append(output)
         self.control = self.callback_handler.on_log(self.args, self.state, self.control, logs)
 
+###################### Abstractive ##############################################
     def _prepare_input(self, data: Union[torch.Tensor, Any]) -> Union[torch.Tensor, Any]:
         """
         Prepares one `data` before feeding it to the model, be it a tensor or a nested list/dictionary of tensors.
@@ -2004,7 +2472,7 @@ class MultiTrainer:
 
         return ctx_manager
 
-    def training_step(self, model: nn.Module, inputs: Dict[str, Union[torch.Tensor, Any]]) -> torch.Tensor:
+    def training_step(self, model: nn.Module, inputs: Dict[str, Union[torch.Tensor, Any]], do_backward=True) -> torch.Tensor:
         """
         Perform a training step on a batch of inputs.
 
@@ -2040,18 +2508,25 @@ class MultiTrainer:
             # deepspeed handles loss scaling by gradient_accumulation_steps in its `backward`
             loss = loss / self.args.gradient_accumulation_steps
 
-        if self.do_grad_scaling:
-            self.scaler.scale(loss).backward()
-        elif self.use_apex:
-            with amp.scale_loss(loss, self.optimizer) as scaled_loss:
-                scaled_loss.backward()
-        elif self.deepspeed:
-            # loss gets scaled under gradient_accumulation_steps in deepspeed
-            loss = self.deepspeed.backward(loss)
-        else:
-            loss.backward()
+        # if self.do_grad_scaling:
+        #     self.scaler.scale(loss).backward()
+        # elif self.use_apex:
+        #     with amp.scale_loss(loss, self.optimizer) as scaled_loss:
+        #         scaled_loss.backward()
+        # elif self.deepspeed:
+        #     # loss gets scaled under gradient_accumulation_steps in deepspeed
+        #     loss = self.deepspeed.backward(loss)
+        # else:
+        #     loss.backward()
 
-        return loss.detach()
+        # return loss.detach()
+
+        if do_backward is True:
+            loss.backward()
+            return loss.detach()
+        else:
+            return loss
+
 
     def compute_loss(self, model, inputs, return_outputs=False):
         """
@@ -2076,7 +2551,124 @@ class MultiTrainer:
             loss = outputs["loss"] if isinstance(outputs, dict) else outputs[0]
 
         return (loss, outputs) if return_outputs else loss
+####################### Extractive ##############################################
 
+    def _prepare_input_ex(self, data: Union[torch.Tensor, Any]) -> Union[torch.Tensor, Any]:
+        """
+        Prepares one `data` before feeding it to the model, be it a tensor or a nested list/dictionary of tensors.
+        """
+        if isinstance(data, Mapping):
+            return type(data)({k: self._prepare_input_ex(v) for k, v in data.items()})
+        elif isinstance(data, (tuple, list)):
+            return type(data)(self._prepare_input_ex(v) for v in data)
+        elif isinstance(data, torch.Tensor):
+            kwargs = dict(device=self.args.device)
+            if self.deepspeed and data.dtype != torch.int64:
+                # NLP models inputs are int64 and those get adjusted to the right dtype of the
+                # embedding. Other models such as wav2vec2's inputs are already float and thus
+                # may need special handling to match the dtypes of the model
+                kwargs.update(dict(dtype=self.args.hf_deepspeed_config.dtype()))
+            return data.to(**kwargs)
+        return data
+
+    def _prepare_inputs_ex(self, inputs: Dict[str, Union[torch.Tensor, Any]]) -> Dict[str, Union[torch.Tensor, Any]]:
+        """
+        Prepare `inputs` before feeding them to the model, converting them to tensors if they are not already and
+        handling potential state.
+        """
+        inputs = self._prepare_input_ex(inputs)
+        if len(inputs) == 0:
+            raise ValueError(
+                "The batch received was empty, your model won't be able to train on it. Double-check that your "
+                f"training dataset contains keys expected by the model: {','.join(self._signature_columns)}."
+            )
+        if self.args.past_index >= 0 and self._past is not None:
+            inputs["mems"] = self._past
+
+        return inputs
+
+    def training_step_ex(self, model: nn.Module, inputs: Dict[str, Union[torch.Tensor, Any]], do_backward=True) -> torch.Tensor:
+        """
+        Perform a training step on a batch of inputs.
+
+        Subclass and override to inject custom behavior.
+
+        Args:
+            model (`nn.Module`):
+                The model to train.
+            inputs (`Dict[str, Union[torch.Tensor, Any]]`):
+                The inputs and targets of the model.
+
+                The dictionary will be unpacked before being fed to the model. Most models expect the targets under the
+                argument `labels`. Check your model's documentation for all accepted arguments.
+
+        Return:
+            `torch.Tensor`: The tensor with training loss on this batch.
+        """
+        model.train()
+        inputs = self._prepare_inputs_ex(inputs)
+        loss = self.compute_loss_ex(model, inputs)
+
+        # if is_sagemaker_mp_enabled():
+        #     scaler = self.scaler if self.do_grad_scaling else None
+        #     loss_mb = smp_forward_backward(model, inputs, self.args.gradient_accumulation_steps, scaler=scaler)
+        #     return loss_mb.reduce_mean().detach().to(self.args.device)
+
+        # with self.autocast_smart_context_manager():
+        #     loss = self.compute_loss_ex(model, inputs)
+
+        if self.args.n_gpu > 1:
+            loss = loss.mean()  # mean() to average on multi-gpu parallel training
+
+        if self.args.gradient_accumulation_steps > 1 and not self.deepspeed:
+            # deepspeed handles loss scaling by gradient_accumulation_steps in its `backward`
+            loss = loss / self.args.gradient_accumulation_steps
+
+        # if self.do_grad_scaling:
+        #     self.scaler.scale(loss).backward()
+        # elif self.use_apex:
+        #     with amp.scale_loss(loss, self.optimizer) as scaled_loss:
+        #         scaled_loss.backward()
+        # elif self.deepspeed:
+        #     # loss gets scaled under gradient_accumulation_steps in deepspeed
+        #     loss = self.deepspeed.backward(loss)
+        # else:
+        #     loss.backward()
+
+        # return loss.detach()
+
+        if do_backward is True:
+            loss.backward()
+            return loss.detach()
+        else:
+            return loss
+
+
+    def compute_loss_ex(self, model, inputs, return_outputs=False):
+        """
+        How the loss is computed by Trainer. By default, all models return the loss in the first element.
+
+        Subclass and override for custom behavior.
+        """
+        if self.label_smoother is not None and "labels" in inputs:
+            labels = inputs.pop("labels")
+        else:
+            labels = None
+        outputs = model.forward_ex(**inputs)
+        # Save past state if it exists
+        # TODO: this needs to be fixed and made cleaner later.
+        if self.args.past_index >= 0:
+            self._past = outputs[self.args.past_index]
+
+        if labels is not None:
+            loss = self.label_smoother(outputs, labels)
+        else:
+            # We don't use .loss here since the model may return tuples instead of ModelOutput.
+            loss = outputs["loss"] if isinstance(outputs, dict) else outputs[0]
+
+        return (loss, outputs) if return_outputs else loss
+
+#################################################################################
     def is_local_process_zero(self) -> bool:
         """
         Whether or not this process is the local (e.g., on one machine if training in a distributed fashion on several
